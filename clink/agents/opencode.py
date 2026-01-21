@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from clink.models import ResolvedCLIRole
 from clink.parsers.base import ParserError
 
@@ -16,8 +17,8 @@ class OpencodeAgent(BaseCLIAgent):
         command.extend(self.client.internal_args)
         command.extend(self.client.config_args)
 
-        if system_prompt and "--prompt" not in self.client.config_args:
-            command.extend(["--prompt", system_prompt])
+        if system_prompt:
+            command.extend(shlex.split(system_prompt))
 
         command.extend(role.role_args)
         return command

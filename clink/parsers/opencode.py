@@ -1,4 +1,4 @@
-"""Parser for Opencode CLI JSON output."""
+"""Parser for Claude CLI JSON output."""
 
 from __future__ import annotations
 
@@ -9,129 +9,67 @@ from .base import BaseParser, ParsedCLIResponse, ParserError
 
 
 class OpencodeJSONParser(BaseParser):
-    """Parse stdout produced by `opencode --output-format json`. """
+    """Parse stdout produced by `opencode --output-format json`."""
 
     name = "opencode_json"
 
     def parse(self, stdout: str, stderr: str) -> ParsedCLIResponse:
-        if not stdout.strip():
-            raise ParserError("Opencode CLI returned empty stdout while JSON output was expected")
+        lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+        events: list[dict[str, Any]] = []
+        extracted_content_parts: list[str] = []
+        errors: list[str] = []
+        usage: dict[str, Any] | None = None
 
-        try:
-            loaded = json.loads(stdout)
-        except json.JSONDecodeError as exc:  # pragma: no cover - defensive logging
-            raise ParserError(f"Failed to decode Opencode CLI JSON output: {exc}") from exc
+        for line in lines:
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        events: list[dict[str, Any]] | None = None
-        assistant_entry: dict[str, Any] | None = None
+            events.append(event)
+            event_type = event.get("type")
 
-        if isinstance(loaded, dict):
-            payload: dict[str, Any] = loaded
-        elif isinstance(loaded, list):
-            events = [item for item in loaded if isinstance(item, dict)]
-            result_entry = next(
-                (item for item in events if item.get("type") == "result" or "result" in item),
-                None,
-            )
-            assistant_entry = next(
-                (item for item in reversed(events) if item.get("type") == "assistant"),
-                None,
-            )
-            payload = result_entry or assistant_entry or (events[-1] if events else {})
-            if not payload:
-                raise ParserError("Opencode CLI JSON array did not contain any parsable objects")
-        else:
-            raise ParserError("Opencode CLI returned unexpected JSON payload")
+            if event_type == "text":
+                part = event.get("part")
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        extracted_content_parts.append(text.strip())
+            elif event_type == "error":
+                message = event.get("message")
+                if isinstance(message, str) and message.strip():
+                    errors.append(message.strip())
+            elif event_type == "step_finish": # Assuming usage info is in step_finish
+                step_finish_data = event.get("part")
+                if isinstance(step_finish_data, dict):
+                    tokens_data = step_finish_data.get("tokens")
+                    if isinstance(tokens_data, dict):
+                        usage = tokens_data
 
-        metadata = self._build_metadata(payload, stderr)
-        if events is not None:
-            metadata["raw_events"] = events
-            metadata["raw"] = loaded
 
-        result = payload.get("result")
-        content: str = ""
-        if isinstance(result, str):
-            content = result.strip()
-        elif isinstance(result, list):
-            # Some CLI flows may emit a list of strings; join them conservatively.
-            joined = [part.strip() for part in result if isinstance(part, str) and part.strip()]
-            content = "\n".join(joined)
+        if not extracted_content_parts and errors:
+            extracted_content_parts.extend(errors)
 
-        if content:
-            return ParsedCLIResponse(content=content, metadata=metadata)
+        if not extracted_content_parts:
+            # If no content, but there's stderr, include it
+            if stderr.strip():
+                return ParsedCLIResponse(
+                    content="Opencode CLI returned no textual result. Raw stderr was preserved for troubleshooting.",
+                    metadata={"stderr": stderr.strip(), "events": events, "errors": errors}
+                )
+            raise ParserError("Opencode CLI JSONL output did not include any text events or errors")
 
-        message = self._extract_message(payload)
-        if message is None and assistant_entry and assistant_entry is not payload:
-            message = self._extract_message(assistant_entry)
-        if message:
-            return ParsedCLIResponse(content=message, metadata=metadata)
-
-        stderr_text = stderr.strip()
-        if stderr_text:
-            metadata.setdefault("stderr", stderr_text)
-            return ParsedCLIResponse(
-                content="Opencode CLI returned no textual result. Raw stderr was preserved for troubleshooting.",
-                metadata=metadata,
-            )
-
-        raise ParserError("Opencode CLI response did not contain a textual result")
-
-    def _build_metadata(self, payload: dict[str, Any], stderr: str) -> dict[str, Any]:
-        metadata: dict[str, Any] = {
-            "raw": payload,
-            "is_error": bool(payload.get("is_error")),
-        }
-
-        type_field = payload.get("type")
-        if isinstance(type_field, str):
-            metadata["type"] = type_field
-        subtype_field = payload.get("subtype")
-        if isinstance(subtype_field, str):
-            metadata["subtype"] = subtype_field
-
-        duration_ms = payload.get("duration_ms")
-        if isinstance(duration_ms, (int, float)):
-            metadata["duration_ms"] = duration_ms
-        api_duration = payload.get("duration_api_ms")
-        if isinstance(api_duration, (int, float)):
-            metadata["duration_api_ms"] = api_duration
-
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
+        content = "\n\n".join(extracted_content_parts).strip()
+        metadata: dict[str, Any] = {"events": events}
+        if errors:
+            metadata["errors"] = errors
+        if usage:
             metadata["usage"] = usage
+        if stderr and stderr.strip():
+            metadata["stderr"] = stderr.strip()
 
-        model_usage = payload.get("modelUsage")
-        if isinstance(model_usage, dict) and model_usage:
-            metadata["model_usage"] = model_usage
-            first_model = next(iter(model_usage.keys()))
-            metadata["model_used"] = first_model
+        return ParsedCLIResponse(content=content, metadata=metadata)
 
-        permission_denials = payload.get("permission_denials")
-        if isinstance(permission_denials, list) and permission_denials:
-            metadata["permission_denials"] = permission_denials
 
-        session_id = payload.get("session_id")
-        if isinstance(session_id, str) and session_id:
-            metadata["session_id"] = session_id
-        uuid_field = payload.get("uuid")
-        if isinstance(uuid_field, str) and uuid_field:
-            metadata["uuid"] = uuid_field
-
-        stderr_text = stderr.strip()
-        if stderr_text:
-            metadata.setdefault("stderr", stderr_text)
-
-        return metadata
-
-    def _extract_message(self, payload: dict[str, Any]) -> str | None:
-        message = payload.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-
-        error_field = payload.get("error")
-        if isinstance(error_field, dict):
-            error_message = error_field.get("message")
-            if isinstance(error_message, str) and error_message.strip():
-                return error_message.strip()
-
-        return None
